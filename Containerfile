@@ -3,7 +3,7 @@ WORKDIR /opt/app-root/src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /opt/app-root/src/kube-applier-gcp .
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /opt/app-root/src/kube-applier-gcp .
 
 FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
 
