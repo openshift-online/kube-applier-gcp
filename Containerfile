@@ -16,7 +16,7 @@ LABEL name="kube-applier-gcp" \
       summary="kube-applier-gcp" \
       distribution-scope="private" \
       url="https://github.com/openshift-online/kube-applier-gcp" \
-      vendor="Red Hat"
+      vendor="Red Hat, Inc."
 
 RUN mkdir /app && chown 65532:65532 /app
 COPY --from=builder /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/certs/ca-certificates.crt
