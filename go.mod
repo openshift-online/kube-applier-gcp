@@ -3,7 +3,7 @@ module github.com/openshift-online/kube-applier-gcp
 go 1.26.0
 
 require (
-	cloud.google.com/go/firestore v1.24.0
+	cloud.google.com/go/firestore v1.25.0
 	github.com/go-logr/logr v1.4.4
 	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.24.1
