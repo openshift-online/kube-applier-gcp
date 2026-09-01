@@ -24,8 +24,9 @@ This is for simplicity in reasoning about the status.
 Every `*Desire` API has a `.spec.managementCluster` field.
 This is the name of the GKE management cluster that `kube-applier-gcp` is running in.
 It matches the value the `kube-applier-gcp` binary was started with via `--management-cluster`.
-Each management cluster project has a pair of Firestore named databases
-(`specs` and `status`). The database names are fixed within each project.
+Each management cluster project deploys Firestore databases named `specs` and
+`status`. These are the binary defaults; explicit database flags may override
+them for local development and testing.
 
 ### Conditions
 Each `*Desire` API has a list of conditions.
