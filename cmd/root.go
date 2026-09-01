@@ -105,11 +105,11 @@ func (f *KubeApplierRootCmdFlags) ToKubeApplierOptions(ctx context.Context) (*ap
 
 	specsDatabaseID := f.FirestoreSpecsDatabase
 	if specsDatabaseID == "" {
-		specsDatabaseID = "mc-" + f.ManagementCluster + "-specs"
+		specsDatabaseID = "specs"
 	}
 	statusDatabaseID := f.FirestoreStatusDatabase
 	if statusDatabaseID == "" {
-		statusDatabaseID = "mc-" + f.ManagementCluster + "-status"
+		statusDatabaseID = "status"
 	}
 
 	specsClient, err := app.NewFirestoreClient(ctx, f.FirestoreProject, specsDatabaseID)
