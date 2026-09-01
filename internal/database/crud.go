@@ -61,8 +61,7 @@ func (c *firestoreSpecReader[T, PT]) List(ctx context.Context) ([]*T, error) {
 }
 
 // firestoreDesireCRUD implements ResourceCRUD[T] against a single Firestore
-// collection. Used for both full-document CRUD (desire-tool) and status-only
-// CRUD (agent status writes).
+// collection for agent status writes.
 type firestoreDesireCRUD[T any, PT desire[T]] struct {
 	client     *firestore.Client
 	collection string

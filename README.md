@@ -1,5 +1,6 @@
+# kube-applier-gcp
 
-`kube-applier` is a per-management-cluster controller binary that runs on GKE and brokers
+`kube-applier-gcp` is a per-management-cluster controller binary that runs on GKE and brokers
 between Google Cloud Firestore and the local Kubernetes apiserver. It reads Desire documents
 from Firestore and reconciles them against the cluster.
 
@@ -12,14 +13,6 @@ At a high level:
    The observed content is written to `.status.kubeContent`.
    Success/failure is written to `.status.conditions["Successful"]`.
 
-## Scale
-The scale of the kube-applier is tiny: it covers a single management cluster.
-A single management cluster will have a low hundreds of HostedClusters and if we have about 100 `*Desires`, we end up
-with about 10k `*Desires`.
-Ten thousand is such a small number that with simple poll and iterate at 50 qps, we can scan every three minutes.
-We'll probably actually use a larger burst and smaller QPS, but it's an easy scale to manage.
-The scale of a region is larger, but is handled by Firestore so it will scale far beyond our needs.
-
 ## API structure
 The API types for this live in `pkg/api/kubeapplier`.
 
@@ -29,11 +22,10 @@ This is for simplicity in reasoning about the status.
 
 ### ManagementCluster
 Every `*Desire` API has a `.spec.managementCluster` field.
-This is the name of the GKE management cluster that the `kube-applier` is running in.
-It matches the value the kube-applier binary was started with via `--management-cluster`.
-Each management cluster has its own pair of Firestore named databases
-(`mc-{clusterName}-specs` and `mc-{clusterName}-status`),
-so the management cluster name determines which databases the binary connects to.
+This is the name of the GKE management cluster that `kube-applier-gcp` is running in.
+It matches the value the `kube-applier-gcp` binary was started with via `--management-cluster`.
+Each management cluster project has a pair of Firestore named databases
+(`specs` and `status`). The database names are fixed within each project.
 
 ### Conditions
 Each `*Desire` API has a list of conditions.
@@ -59,7 +51,7 @@ When the kube-apiserver call cannot be executed,
 Every `*Desire` status carries an `ObservedDesireUpdateTime` field set to the
 Firestore-managed `UpdateTime` of the spec document that was reconciled. This
 tells the backend "I have processed the spec as of this Firestore revision."
-There is no application-managed generation counter — the server-managed
+There is no application-managed generation counter; the server-managed
 `UpdateTime` serves that role.
 
 `ApplyDesireStatus` additionally carries `AppliedResourceGeneration`: the
@@ -74,17 +66,17 @@ directional isolation:
 
 | Database | Agent access | Backend access | Contents |
 |----------|-------------|----------------|----------|
-| `mc-{clusterName}-specs` | read-only | read-write | Spec documents written by the backend |
-| `mc-{clusterName}-status` | read-write | read-only | Status documents written by the agent |
+| `specs` | read-only | read-write | Spec documents written by the backend |
+| `status` | read-write | read-only | Status documents written by the agent |
 
 Each database contains three collections with matching document IDs:
-```
-database: mc-{managementClusterName}-specs   (agent: read-only)
+```text
+database: specs   (agent: read-only)
   applydesires/{uuid}
   deletedesires/{uuid}
   readdesires/{uuid}
 
-database: mc-{managementClusterName}-status  (agent: read-write)
+database: status  (agent: read-write)
   applydesires/{uuid}
   deletedesires/{uuid}
   readdesires/{uuid}
@@ -107,10 +99,10 @@ document changes as they happen, rather than polling. The informer's resync peri
 still triggers periodic handler resyncs for cooldown-gated re-reconciliation.
 
 ### Authentication and isolation
-- GKE Workload Identity Federation: pod KSA → IAM GSA (no service account keys)
+- GKE Workload Identity Federation: the pod KSA authenticates directly as a WIF principal (no service account keys or intermediary GSA)
 - Per-database IAM conditions:
-  - `roles/datastore.viewer` on specs-db: `resource.name == "projects/{project}/databases/mc-{cluster}-specs"`
-  - `roles/datastore.user` on status-db: `resource.name == "projects/{project}/databases/mc-{cluster}-status"`
+  - `roles/datastore.viewer` on specs-db: `resource.name == "projects/{project}/databases/specs"`
+  - `roles/datastore.user` on status-db: `resource.name == "projects/{project}/databases/status"`
 
 ### Golang type details for Database
 The golang types live in `internal/database`.
@@ -129,13 +121,13 @@ accessors for the status database:
 `ResourceCRUD[T]` provides flat CRUD operations: `Get`, `List`, `Create`, `Replace`, `Delete`.
 `Replace` uses `firestore.Update` with `LastUpdateTime` precondition for optimistic concurrency —
 if the document has changed since the last read, the write fails with `codes.FailedPrecondition`
-and the controller retries with a fresh read. `Replace` uses `Update` (not `Set`) because
-Firestore's `Set` method does not accept a `LastUpdateTime` precondition; `Update` replaces
-the `spec` and `status` fields entirely, which is equivalent to a full document overwrite
-since those are the only data fields.
+and the status writer treats the conflict as a no-op; a later spec event or informer resync
+can reconcile it again. `Replace` uses `Update` (not `Set`) because Firestore's `Set` method
+does not accept a `LastUpdateTime` precondition. It replaces `spec`, `status`,
+`spec_kubeContent`, and `status_kubeContent`, deleting absent KubeContent fields.
 
 Each desire type carries a `FirestoreMetadata` struct with:
-- `DocumentID` — the Firestore document path (UUID v5)
+- `DocumentID` — the Firestore document ID (UUID v5)
 - `UpdateTime` — server-managed timestamp, used as the optimistic concurrency token
 - `CreateTime` — server-managed creation timestamp
 
@@ -153,8 +145,8 @@ are unordered), but the data is semantically identical.
 
 The kube-applier binary opens two databases — specs and status — via
 `NewFirestoreKubeApplierDBClient(specsClient, statusClient)`.
-The backend service constructs clients for each MC database deterministically
-from the MC name; no registry or lister walk is needed.
+The backend service connects to the fixed database names in each management
+cluster project; no database-name registry or lister walk is needed.
 
 Controllers receive a `SpecReader` for fetching the current spec from specs-db
 and a `ResourceCRUD` for writing status to status-db. The `desirestatuswriter`
@@ -176,30 +168,24 @@ The `internal/database/informers`, `internal/database/listers`, and
 `*Desire` APIs.
 
 ## Controller structure
-The `kube-applier` binary is controller-based with several controllers.
-Instead of using a `Controller` type to communicate `Degraded` status, that is communicated
-on the `*Desire` `.status.conditions["Degraded"]` field.
+The `kube-applier-gcp` binary is controller-based with several controllers.
+Consumers should use the `Successful` condition as the operation outcome for
+all Desire types. Apply and Delete desires additionally use `Degraded` for
+classified controller-level failures. Pre-check and Kubernetes 4xx errors set
+`Successful=False` without degradation; other API errors also set
+`Degraded=True`. Read desires report only `Successful`.
 
-Change detection uses `UpdateTime` comparison: a controller's `handleUpdate` only
-enqueues work when `!oldD.UpdateTime.Equal(newD.UpdateTime)`. The field manager for
-server-side-apply is `gcp-hcp-kube-applier`.
+Change detection uses `UpdateTime`: changed revisions enqueue immediately, while
+unchanged informer resync events are cooldown-gated. The field manager for
+server-side apply is `gcp-hcp-kube-applier`.
 
 ### ReadDesireKubernetesController
 An instance of this controller is created and started for each `ReadDesire` instance.
-Each instance holds:
-1. the `.spec.targetItem`
-2. the `ReadDesireLister`
-3. a single-item kubernetes informer
-4. a single-item kubernetes lister
-5. a `KubeApplierDBClient`
-6. the document ID of the `ReadDesire` instance
-
-In addition to running when the informer triggers, the controller unconditionally runs every one minute.
-We do this so that if the item doesn't exist, we can properly report that.
-
-When the sync loop runs, we read the item from the kubernetes lister and from the `ReadDesireLister` and compare the
-`.status.kubeContent` against the kubernetes lister result.
-If they are different, we update the `.status.kubeContent` and write it back to the database.
+Each instance holds the target reference and spec update time, a single-object
+Kubernetes informer, a status-database fetcher/writer, and its work queue. In
+addition to informer events, it resyncs every minute so a missing target is also
+reported. The sync loop compares the object in the informer store with
+`.status.kubeContent` from the status database and writes changes back.
 
 ### ReadDesireInformerManagingController
 This controller uses the `ReadDesire` informer to feed a sync function for `ReadDesire` instances.
@@ -230,11 +216,9 @@ When the sync loop runs, it will:
    3. If it does exist and has no deletion timestamp:
       1. Issue a delete for the `.spec.targetItem`.
          1. If unsuccessful, use the standard rule for `.status.conditions["Successful"]` and return
-         2. If successful, issue a get for the deletion timestamp, indicate:
-            1. `.status.conditions["Successful"].status` is false
-            2. `.status.conditions["Successful"].reason` is "WaitingForDeletion"
-            3. `.status.conditions["Successful"].message` contains a message that includes the deletion timestamp and UID
-            4. and return
+         2. If successful, issue another get. If the resource is gone, report
+            success; otherwise report `WaitingForDeletion` with its deletion
+            timestamp and UID.
 
 This controller resyncs every 60 seconds.
 
@@ -258,8 +242,6 @@ this case-by-case rather than baking adoption logic into the kube-applier.
 Unit tests use the `internal/database/listertesting` package to create fake Firestore-compatible
 database clients with `UpdateTime`-based optimistic concurrency tracking.
 
-Integration tests use [envtest](https://book.kubebuilder.io/reference/envtest.html)
-(via `sigs.k8s.io/controller-runtime`) to bring up a real `kube-apiserver` +
-`etcd` in-process, paired with the Firestore emulator (`FIRESTORE_EMULATOR_HOST`).
-envtest gives us the actual SSA conflict and admission semantics that a fake client
-cannot reproduce, without the Docker dependency a `kind`-based suite would need.
+Database integration tests use the Firestore emulator configured through
+`FIRESTORE_EMULATOR_HOST`. Controller tests use client-go fake Kubernetes clients;
+this repository does not currently run a real kube-apiserver in its test suite.
