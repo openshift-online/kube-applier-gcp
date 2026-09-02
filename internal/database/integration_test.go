@@ -493,8 +493,9 @@ func TestIntegration_CreateDuplicate(t *testing.T) {
 
 func TestIntegration_ClientClose(t *testing.T) {
 	requireEmulator(t)
-	client := newTestClient(t)
-	dbClient := NewFirestoreKubeApplierDBClient(client, client)
+	specsClient := newTestClient(t)
+	statusClient := newTestClient(t)
+	dbClient := NewFirestoreKubeApplierDBClient(specsClient, statusClient)
 	if err := dbClient.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
