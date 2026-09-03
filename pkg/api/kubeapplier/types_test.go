@@ -2,6 +2,7 @@ package kubeapplier
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -18,7 +19,8 @@ func newTestApplyDesire() *ApplyDesire {
 		},
 		Spec: ApplyDesireSpec{
 			ManagementCluster: "mc-dev-westus3-1",
-			ClusterID:       "cluster-a",
+			ClusterID:         "cluster-a",
+			GroupKey:          "group-a",
 			NodePoolName:      "np-1",
 			TargetItem: ResourceReference{
 				Group:     "",
@@ -39,7 +41,7 @@ func newTestApplyDesire() *ApplyDesire {
 					Reason: ConditionReasonNoErrors,
 				},
 			},
-			ObservedDesireUpdateTime: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			ObservedDesireUpdateTime:  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 			AppliedResourceGeneration: 100,
 		},
 	}
@@ -103,8 +105,37 @@ func TestApplyDesire_JSONRoundTrip(t *testing.T) {
 	if decoded.Spec.ClusterID != original.Spec.ClusterID {
 		t.Errorf("ClusterID: got %s, want %s", decoded.Spec.ClusterID, original.Spec.ClusterID)
 	}
+	if decoded.Spec.GroupKey != original.Spec.GroupKey {
+		t.Errorf("GroupKey: got %s, want %s", decoded.Spec.GroupKey, original.Spec.GroupKey)
+	}
 	if decoded.Spec.ManagementCluster != original.Spec.ManagementCluster {
 		t.Errorf("ManagementCluster: got %s, want %s", decoded.Spec.ManagementCluster, original.Spec.ManagementCluster)
+	}
+}
+
+func TestDesireSpec_GroupKeyFirestoreTag(t *testing.T) {
+	tests := []struct {
+		name     string
+		specType reflect.Type
+	}{
+		{name: "ApplyDesireSpec", specType: reflect.TypeOf(ApplyDesireSpec{})},
+		{name: "DeleteDesireSpec", specType: reflect.TypeOf(DeleteDesireSpec{})},
+		{name: "ReadDesireSpec", specType: reflect.TypeOf(ReadDesireSpec{})},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			field, ok := tt.specType.FieldByName("GroupKey")
+			if !ok {
+				t.Fatal("GroupKey field is missing")
+			}
+			if field.Type.Kind() != reflect.String {
+				t.Errorf("GroupKey type: got %s, want string", field.Type)
+			}
+			if got := field.Tag.Get("firestore"); got != "groupKey" {
+				t.Errorf("GroupKey firestore tag: got %q, want %q", got, "groupKey")
+			}
+		})
 	}
 }
 
@@ -131,11 +162,11 @@ func TestDeleteDesire_DeepCopy_Isolation(t *testing.T) {
 	original := &DeleteDesire{
 		FirestoreMetadata: FirestoreMetadata{DocumentID: "my-delete-desire"},
 		Spec: DeleteDesireSpec{
-			ClusterID: "cluster-a",
-			TargetItem:  ResourceReference{Version: "v1", Resource: "configmaps", Name: "x"},
+			ClusterID:  "cluster-a",
+			TargetItem: ResourceReference{Version: "v1", Resource: "configmaps", Name: "x"},
 		},
 		Status: DeleteDesireStatus{
-			Conditions:             []metav1.Condition{{Type: ConditionTypeSuccessful, Status: metav1.ConditionTrue}},
+			Conditions:               []metav1.Condition{{Type: ConditionTypeSuccessful, Status: metav1.ConditionTrue}},
 			ObservedDesireUpdateTime: time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC),
 		},
 	}
@@ -151,13 +182,13 @@ func TestReadDesire_DeepCopy_Isolation(t *testing.T) {
 	original := &ReadDesire{
 		FirestoreMetadata: FirestoreMetadata{DocumentID: "my-read-desire"},
 		Spec: ReadDesireSpec{
-			ClusterID: "cluster-a",
-			TargetItem:  ResourceReference{Version: "v1", Resource: "secrets", Name: "x"},
+			ClusterID:  "cluster-a",
+			TargetItem: ResourceReference{Version: "v1", Resource: "secrets", Name: "x"},
 		},
 		Status: ReadDesireStatus{
-			Conditions:             []metav1.Condition{{Type: ConditionTypeSuccessful, Status: metav1.ConditionTrue}},
+			Conditions:               []metav1.Condition{{Type: ConditionTypeSuccessful, Status: metav1.ConditionTrue}},
 			ObservedDesireUpdateTime: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
-			KubeContent:            &runtime.RawExtension{Raw: []byte(`{"data":"secret"}`)},
+			KubeContent:              &runtime.RawExtension{Raw: []byte(`{"data":"secret"}`)},
 		},
 	}
 	copied := original.DeepCopy()

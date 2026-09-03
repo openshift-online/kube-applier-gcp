@@ -19,10 +19,10 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	clocktesting "k8s.io/utils/clock/testing"
 
-	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/internal/controllerutils"
 	"github.com/openshift-online/kube-applier-gcp/internal/database"
 	"github.com/openshift-online/kube-applier-gcp/internal/database/listertesting"
+	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
@@ -48,6 +48,8 @@ func newApplyDesire(t *testing.T, name string, target kubeapplier.ResourceRefere
 	d.Spec = kubeapplier.ApplyDesireSpec{
 		ManagementCluster: "mc-1",
 		ClusterID:         "cluster1",
+		GroupKey:          "group-1",
+		NodePoolName:      "nodepool-1",
 		TargetItem:        target,
 	}
 	if kubeContent != nil {
@@ -358,6 +360,27 @@ func TestSyncOnce_Success(t *testing.T) {
 	}
 	if updated.Status.AppliedResourceGeneration != 3 {
 		t.Errorf("AppliedResourceGeneration: got %d, want %d", updated.Status.AppliedResourceGeneration, 3)
+	}
+	wantSpec := created.Spec
+	wantSpec.KubeContent = nil
+	if updated.Spec != wantSpec {
+		t.Errorf("status spec = %#v, want %#v", updated.Spec, wantSpec)
+	}
+
+	created.Spec.GroupKey = "group-2"
+	created, err = specCRUD.Replace(ctx, created)
+	if err != nil {
+		t.Fatalf("replace spec: %v", err)
+	}
+	if err := c.SyncOnce(ctx, key); err != nil {
+		t.Fatalf("SyncOnce after spec update: %v", err)
+	}
+	updated, err = statusCRUD.Get(ctx, created.DocumentID)
+	if err != nil {
+		t.Fatalf("get after spec update: %v", err)
+	}
+	if updated.Spec.GroupKey != "group-2" {
+		t.Errorf("status GroupKey = %q, want %q", updated.Spec.GroupKey, "group-2")
 	}
 }
 

@@ -12,8 +12,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/internal/database/listertesting"
+	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
@@ -33,13 +33,15 @@ func newReadDesire(t *testing.T, target kubeapplier.ResourceReference) *kubeappl
 	d.Spec = kubeapplier.ReadDesireSpec{
 		ManagementCluster: "mc-1",
 		ClusterID:         "cluster1",
+		GroupKey:          "group-1",
+		NodePoolName:      "nodepool-1",
 		TargetItem:        target,
 	}
 	return d
 }
 
 func testKey() keys.ReadDesireKey {
-	return keys.ReadDesireKey{ClusterID: "cluster1", Name: "cluster1--rd1"}
+	return keys.ReadDesireKey{ClusterID: "cluster1", NodePoolName: "nodepool-1", Name: "cluster1--rd1"}
 }
 
 // recordingWriter captures UpdateStatus calls for assertion.
@@ -82,8 +84,8 @@ type fakeInformer struct {
 	synced  bool
 }
 
-func (f *fakeInformer) GetStore() cache.Store       { return f.indexer }
-func (f *fakeInformer) HasSynced() bool              { return f.synced }
+func (f *fakeInformer) GetStore() cache.Store { return f.indexer }
+func (f *fakeInformer) HasSynced() bool       { return f.synced }
 
 func testConfigMap(name string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
@@ -107,7 +109,7 @@ func TestNewReadDesireKubernetesController_PreCheckError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewReadDesireKubernetesController(testKey(), tt.target, time.Unix(1, 0), nil, crud)
+			_, err := NewReadDesireKubernetesController(testKey(), kubeapplier.ReadDesireSpec{TargetItem: tt.target}, time.Unix(1, 0), nil, crud)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -124,11 +126,14 @@ func TestNewReadDesireKubernetesController_PreCheckError(t *testing.T) {
 func TestSyncOnce_TargetExists(t *testing.T) {
 	cm := testConfigMap("cm1")
 	desire := newReadDesire(t, configMapTarget("cm1"))
-	writer := &recordingWriter{desire: desire}
+	statusDesire := desire.DeepCopy()
+	statusDesire.Spec = kubeapplier.ReadDesireSpec{}
+	writer := &recordingWriter{desire: statusDesire}
 
 	specTime := time.Unix(1, 0)
 	c := &ReadDesireKubernetesController{
 		key:            testKey(),
+		spec:           desire.Spec,
 		target:         configMapTarget("cm1"),
 		specUpdateTime: specTime,
 		namespaced:     true,
@@ -145,6 +150,9 @@ func TestSyncOnce_TargetExists(t *testing.T) {
 		t.Fatalf("expected 1 update, got %d", len(writer.updates))
 	}
 	updated := writer.updates[0]
+	if updated.Spec != desire.Spec {
+		t.Errorf("status spec = %#v, want %#v", updated.Spec, desire.Spec)
+	}
 	if updated.Status.KubeContent == nil {
 		t.Fatal("expected KubeContent to be set")
 	}
@@ -168,6 +176,7 @@ func TestSyncOnce_TargetAbsent_AfterSync(t *testing.T) {
 
 	c := &ReadDesireKubernetesController{
 		key:            testKey(),
+		spec:           desire.Spec,
 		target:         configMapTarget("cm1"),
 		specUpdateTime: time.Unix(1, 0),
 		namespaced:     true,
@@ -201,6 +210,7 @@ func TestSyncOnce_ByteEqual_NoOp(t *testing.T) {
 
 	c := &ReadDesireKubernetesController{
 		key:            testKey(),
+		spec:           desire.Spec,
 		target:         configMapTarget("cm1"),
 		specUpdateTime: time.Unix(1, 0),
 		namespaced:     true,
@@ -227,6 +237,7 @@ func TestSyncOnce_NotSynced_Skips(t *testing.T) {
 
 	c := &ReadDesireKubernetesController{
 		key:            testKey(),
+		spec:           desire.Spec,
 		target:         configMapTarget("cm1"),
 		specUpdateTime: time.Unix(1, 0),
 		informer:       unsyncedInformer(),
@@ -249,6 +260,7 @@ func TestSyncOnce_DesireNotFound(t *testing.T) {
 
 	c := &ReadDesireKubernetesController{
 		key:            testKey(),
+		spec:           kubeapplier.ReadDesireSpec{TargetItem: configMapTarget("cm1")},
 		target:         configMapTarget("cm1"),
 		specUpdateTime: time.Unix(1, 0),
 		informer:       syncedInformer(),
@@ -284,6 +296,7 @@ func TestSyncOnce_ClusterScoped(t *testing.T) {
 
 	c := &ReadDesireKubernetesController{
 		key:            testKey(),
+		spec:           desire.Spec,
 		target:         target,
 		specUpdateTime: time.Unix(1, 0),
 		namespaced:     false,

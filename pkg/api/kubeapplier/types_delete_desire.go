@@ -18,12 +18,13 @@ type DeleteDesire struct {
 type DeleteDesireSpec struct {
 	ManagementCluster string            `json:"managementCluster" firestore:"managementCluster"`
 	ClusterID         string            `json:"clusterID" firestore:"clusterID"`
+	GroupKey          string            `json:"groupKey" firestore:"groupKey"`
 	NodePoolName      string            `json:"nodePoolName,omitempty" firestore:"nodePoolName,omitempty"`
 	TargetItem        ResourceReference `json:"targetItem,omitempty" firestore:"targetItem"`
 }
 
 type DeleteDesireStatus struct {
-	Conditions             []metav1.Condition `json:"conditions,omitempty" firestore:"conditions,omitempty"`
+	Conditions               []metav1.Condition `json:"conditions,omitempty" firestore:"conditions,omitempty"`
 	ObservedDesireUpdateTime time.Time          `json:"observedDesireUpdateTime,omitempty" firestore:"observedDesireUpdateTime,omitempty"`
 }
 

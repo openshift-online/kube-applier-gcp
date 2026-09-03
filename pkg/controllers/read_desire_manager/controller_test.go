@@ -10,9 +10,9 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	clocktesting "k8s.io/utils/clock/testing"
 
-	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/internal/controllerutils"
 	"github.com/openshift-online/kube-applier-gcp/internal/database/listertesting"
+	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
@@ -32,28 +32,32 @@ func newReadDesire(t *testing.T, target kubeapplier.ResourceReference) *kubeappl
 	d.Spec = kubeapplier.ReadDesireSpec{
 		ManagementCluster: "mc-1",
 		ClusterID:         "cluster1",
+		GroupKey:          "group-1",
+		NodePoolName:      "nodepool-1",
 		TargetItem:        target,
 	}
 	return d
 }
 
 func testKey() keys.ReadDesireKey {
-	return keys.ReadDesireKey{ClusterID: "cluster1", Name: "cluster1--rd1"}
+	return keys.ReadDesireKey{ClusterID: "cluster1", NodePoolName: "nodepool-1", Name: "cluster1--rd1"}
 }
 
 // fakePerInstance is a stand-in for ReadDesireKubernetesController that
 // records its lifecycle so the manager test can assert on start/stop ordering.
 type fakePerInstance struct {
 	target  kubeapplier.ResourceReference
+	spec    kubeapplier.ReadDesireSpec
 	mu      sync.Mutex
 	running bool
 	started chan struct{}
 	stopped chan struct{}
 }
 
-func newFakePerInstance(t kubeapplier.ResourceReference) *fakePerInstance {
+func newFakePerInstance(spec kubeapplier.ReadDesireSpec) *fakePerInstance {
 	return &fakePerInstance{
-		target:  t,
+		target:  spec.TargetItem,
+		spec:    spec,
 		started: make(chan struct{}),
 		stopped: make(chan struct{}),
 	}
@@ -83,9 +87,9 @@ type recordingFakeFactory struct {
 }
 
 func (f *recordingFakeFactory) Build(
-	_ keys.ReadDesireKey, target kubeapplier.ResourceReference, _ time.Time,
+	_ keys.ReadDesireKey, spec kubeapplier.ReadDesireSpec, _ time.Time,
 ) (PerInstanceController, error) {
-	fake := newFakePerInstance(target)
+	fake := newFakePerInstance(spec)
 	f.fakes = append(f.fakes, fake)
 	return fake, nil
 }
@@ -95,7 +99,7 @@ type errorFactory struct {
 	err error
 }
 
-func (f *errorFactory) Build(_ keys.ReadDesireKey, _ kubeapplier.ResourceReference, _ time.Time) (PerInstanceController, error) {
+func (f *errorFactory) Build(_ keys.ReadDesireKey, _ kubeapplier.ReadDesireSpec, _ time.Time) (PerInstanceController, error) {
 	return nil, f.err
 }
 
@@ -132,9 +136,9 @@ func newTestController(
 	}
 	return &ReadDesireInformerManagingController{
 		specFetcher: &readDesireSpecFetcher{reader: crud},
-		factory: factory,
-		running: map[keys.ReadDesireKey]*runningInstance{},
-		writer:  writer,
+		factory:     factory,
+		running:     map[keys.ReadDesireKey]*runningInstance{},
+		writer:      writer,
 	}
 }
 
@@ -212,6 +216,44 @@ func TestManagerSyncOnce_RestartsOnTargetChange(t *testing.T) {
 	<-factory.fakes[1].started
 	if factory.fakes[1].target != t2 {
 		t.Errorf("second factory got target %v, want %v", factory.fakes[1].target, t2)
+	}
+}
+
+func TestManagerSyncOnce_RestartsOnSpecMetadataChange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	desire := newReadDesire(t, configMapTarget("x"))
+	crud := listertesting.NewFakeCRUD[kubeapplier.ReadDesire, *kubeapplier.ReadDesire]()
+	created, err := crud.Create(ctx, desire)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	factory := &recordingFakeFactory{}
+	c := newTestController(crud, factory, nil)
+	key := testKey()
+
+	if err := c.SyncOnce(ctx, key); err != nil {
+		t.Fatalf("first SyncOnce: %v", err)
+	}
+	<-factory.fakes[0].started
+
+	created.Spec.GroupKey = "group-2"
+	if _, err := crud.Replace(ctx, created); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	if err := c.SyncOnce(ctx, key); err != nil {
+		t.Fatalf("second SyncOnce: %v", err)
+	}
+
+	<-factory.fakes[0].stopped
+	if len(factory.fakes) != 2 {
+		t.Fatalf("expected 2 factory calls, got %d", len(factory.fakes))
+	}
+	<-factory.fakes[1].started
+	if factory.fakes[1].spec.GroupKey != "group-2" {
+		t.Errorf("new controller GroupKey = %q, want %q", factory.fakes[1].spec.GroupKey, "group-2")
 	}
 }
 
@@ -323,6 +365,7 @@ func TestStopAll_CleansUpAllInstances(t *testing.T) {
 	d2.Spec = kubeapplier.ReadDesireSpec{
 		ManagementCluster: "mc-1",
 		ClusterID:         "cluster1",
+		GroupKey:          "group-1",
 		TargetItem:        configMapTarget("y"),
 	}
 	if _, err := crud.Create(ctx, d2); err != nil {

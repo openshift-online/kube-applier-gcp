@@ -26,9 +26,9 @@ import (
 	"k8s.io/klog/v2"
 	utilsclock "k8s.io/utils/clock"
 
-	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/internal/controllerutils"
 	"github.com/openshift-online/kube-applier-gcp/internal/database"
+	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
@@ -219,6 +219,8 @@ func (c *ApplyDesireController) SyncOnce(ctx context.Context, key keys.ApplyDesi
 
 	statusErr := c.writer.UpdateStatus(ctx, key, func(d *kubeapplier.ApplyDesire) {
 		d.SetDocumentID(desire.GetDocumentID())
+		d.Spec = desire.Spec
+		d.Spec.KubeContent = nil
 		d.Status.ObservedDesireUpdateTime = desire.GetUpdateTime()
 		d.Status.AppliedResourceGeneration = appliedGen
 		conditions.SetSuccessful(&d.Status.Conditions, syncErr)
