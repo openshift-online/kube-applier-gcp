@@ -1,7 +1,7 @@
 // Package read_desire_manager implements the ReadDesireInformerManagingController.
 //
 // It watches the ReadDesire informer and, for every key, owns the lifecycle of a
-// per-ReadDesire ReadDesireKubernetesController. When a ReadDesire's TargetItem
+// per-ReadDesire ReadDesireKubernetesController. When a ReadDesire's spec
 // changes, the manager stops the old per-instance controller (waiting for its
 // goroutine to exit) and starts a fresh one.
 package read_desire_manager
@@ -20,9 +20,9 @@ import (
 	"k8s.io/klog/v2"
 	utilsclock "k8s.io/utils/clock"
 
-	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	controllerutil "github.com/openshift-online/kube-applier-gcp/internal/controllerutils"
 	"github.com/openshift-online/kube-applier-gcp/internal/database"
+	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
@@ -56,7 +56,7 @@ type PerInstanceController interface {
 
 // PerInstanceFactory builds a per-ReadDesire controller.
 type PerInstanceFactory interface {
-	Build(key keys.ReadDesireKey, target kubeapplier.ResourceReference, specUpdateTime time.Time) (PerInstanceController, error)
+	Build(key keys.ReadDesireKey, spec kubeapplier.ReadDesireSpec, specUpdateTime time.Time) (PerInstanceController, error)
 }
 
 // ReadDesireInformerManagingController watches ReadDesires and manages the
@@ -76,7 +76,7 @@ type ReadDesireInformerManagingController struct {
 }
 
 type runningInstance struct {
-	target kubeapplier.ResourceReference
+	spec   kubeapplier.ReadDesireSpec
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -134,9 +134,9 @@ type realPerInstanceFactory struct {
 var _ PerInstanceFactory = &realPerInstanceFactory{}
 
 func (f *realPerInstanceFactory) Build(
-	key keys.ReadDesireKey, target kubeapplier.ResourceReference, specUpdateTime time.Time,
+	key keys.ReadDesireKey, spec kubeapplier.ReadDesireSpec, specUpdateTime time.Time,
 ) (PerInstanceController, error) {
-	return read_desire_kubernetes.NewReadDesireKubernetesController(key, target, specUpdateTime, f.dyn, f.statusCRUD)
+	return read_desire_kubernetes.NewReadDesireKubernetesController(key, spec, specUpdateTime, f.dyn, f.statusCRUD)
 }
 
 func (c *ReadDesireInformerManagingController) Run(ctx context.Context, threadiness int) {
@@ -245,18 +245,18 @@ func (c *ReadDesireInformerManagingController) SyncOnce(ctx context.Context, key
 	cur, exists := c.running[key]
 	c.mu.Unlock()
 
-	target := desire.Spec.TargetItem
-	if exists && cur.target == target {
+	if exists && cur.spec == desire.Spec {
 		return nil
 	}
 	if exists {
 		c.stopByKey(key)
 	}
 
-	per, err := c.factory.Build(key, target, desire.GetUpdateTime())
+	per, err := c.factory.Build(key, desire.Spec, desire.GetUpdateTime())
 	if err != nil {
 		return c.writer.UpdateStatus(ctx, key, func(d *kubeapplier.ReadDesire) {
 			d.SetDocumentID(desire.GetDocumentID())
+			d.Spec = desire.Spec
 			d.Status.ObservedDesireUpdateTime = desire.GetUpdateTime()
 			conditions.SetSuccessful(&d.Status.Conditions, err)
 		})
@@ -265,7 +265,7 @@ func (c *ReadDesireInformerManagingController) SyncOnce(ctx context.Context, key
 	childCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	c.mu.Lock()
-	c.running[key] = &runningInstance{target: target, cancel: cancel, done: done}
+	c.running[key] = &runningInstance{spec: desire.Spec, cancel: cancel, done: done}
 	c.mu.Unlock()
 
 	go func() {

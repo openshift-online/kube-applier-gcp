@@ -19,9 +19,9 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	clocktesting "k8s.io/utils/clock/testing"
 
-	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/internal/controllerutils"
 	"github.com/openshift-online/kube-applier-gcp/internal/database/listertesting"
+	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
@@ -49,6 +49,8 @@ func newDeleteDesire(t *testing.T, name string, target kubeapplier.ResourceRefer
 	d.Spec = kubeapplier.DeleteDesireSpec{
 		ManagementCluster: "mc-1",
 		ClusterID:         "cluster1",
+		GroupKey:          "group-1",
+		NodePoolName:      "nodepool-1",
 		TargetItem:        target,
 	}
 	return d
@@ -95,8 +97,8 @@ func terminatingConfigMap(name string) *unstructured.Unstructured {
 		"apiVersion": "v1", "kind": "ConfigMap",
 		"metadata": map[string]any{
 			"name": name, "namespace": "default",
-			"uid":               "test-uid-123",
-			"deletionTimestamp":  now.Format(time.RFC3339),
+			"uid":                        "test-uid-123",
+			"deletionTimestamp":          now.Format(time.RFC3339),
 			"deletionGracePeriodSeconds": int64(0),
 		},
 	}}
@@ -337,6 +339,25 @@ func TestSyncOnce_Success_TargetAbsent(t *testing.T) {
 	assertCondition(t, updated.Status.Conditions, kubeapplier.ConditionTypeSuccessful, metav1.ConditionTrue, "")
 	if !updated.Status.ObservedDesireUpdateTime.Equal(created.GetUpdateTime()) {
 		t.Errorf("ObservedDesireUpdateTime: got %v, want %v", updated.Status.ObservedDesireUpdateTime, created.GetUpdateTime())
+	}
+	if updated.Spec != created.Spec {
+		t.Errorf("status spec = %#v, want %#v", updated.Spec, created.Spec)
+	}
+
+	created.Spec.GroupKey = "group-2"
+	created, err = specCRUD.Replace(ctx, created)
+	if err != nil {
+		t.Fatalf("replace spec: %v", err)
+	}
+	if err := c.SyncOnce(ctx, key); err != nil {
+		t.Fatalf("SyncOnce after spec update: %v", err)
+	}
+	updated, err = statusCRUD.Get(ctx, created.DocumentID)
+	if err != nil {
+		t.Fatalf("get after spec update: %v", err)
+	}
+	if updated.Spec.GroupKey != "group-2" {
+		t.Errorf("status GroupKey = %q, want %q", updated.Spec.GroupKey, "group-2")
 	}
 }
 

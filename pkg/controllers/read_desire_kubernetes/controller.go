@@ -25,8 +25,8 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/internal/database"
+	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
@@ -51,6 +51,7 @@ func (listWatchWithoutWatchListSemantics) IsWatchListSemanticsUnSupported() bool
 // ReadDesire's status. One instance per ReadDesire is owned by the manager.
 type ReadDesireKubernetesController struct {
 	key            keys.ReadDesireKey
+	spec           kubeapplier.ReadDesireSpec
 	target         kubeapplier.ResourceReference
 	specUpdateTime time.Time
 	gvr            schema.GroupVersionResource
@@ -69,11 +70,12 @@ type ReadDesireKubernetesController struct {
 // touches only the named object.
 func NewReadDesireKubernetesController(
 	key keys.ReadDesireKey,
-	target kubeapplier.ResourceReference,
+	spec kubeapplier.ReadDesireSpec,
 	specUpdateTime time.Time,
 	dyn dynamic.Interface,
 	statusCRUD database.ResourceCRUD[kubeapplier.ReadDesire],
 ) (*ReadDesireKubernetesController, error) {
+	target := spec.TargetItem
 	if len(target.Resource) == 0 || len(target.Version) == 0 || len(target.Name) == 0 {
 		return nil, conditions.NewPreCheckError(errors.New("spec.targetItem requires version, resource, and name"))
 	}
@@ -81,6 +83,7 @@ func NewReadDesireKubernetesController(
 	fetcher := &readDesireStatusFetcher{crud: statusCRUD}
 	c := &ReadDesireKubernetesController{
 		key:            key,
+		spec:           spec,
 		target:         target,
 		specUpdateTime: specUpdateTime,
 		gvr: schema.GroupVersionResource{
@@ -202,9 +205,7 @@ func (c *ReadDesireKubernetesController) SyncOnce(ctx context.Context) error {
 	}
 	rawObj, exists, err := c.informer.GetStore().GetByKey(storeKey)
 	if err != nil {
-		return c.writer.UpdateStatus(ctx, c.key, func(d *kubeapplier.ReadDesire) {
-			d.SetDocumentID(c.key.Name)
-			d.Status.ObservedDesireUpdateTime = c.specUpdateTime
+		return c.updateStatus(ctx, func(d *kubeapplier.ReadDesire) {
 			conditions.SetSuccessful(&d.Status.Conditions, fmt.Errorf("read cache: %w", err))
 		})
 	}
@@ -213,18 +214,14 @@ func (c *ReadDesireKubernetesController) SyncOnce(ctx context.Context) error {
 	if exists {
 		obj, ok := rawObj.(*unstructured.Unstructured)
 		if !ok {
-			return c.writer.UpdateStatus(ctx, c.key, func(d *kubeapplier.ReadDesire) {
-				d.SetDocumentID(c.key.Name)
-				d.Status.ObservedDesireUpdateTime = c.specUpdateTime
+			return c.updateStatus(ctx, func(d *kubeapplier.ReadDesire) {
 				conditions.SetSuccessful(&d.Status.Conditions, conditions.NewPreCheckError(
 					fmt.Errorf("informer cached unexpected type %T", rawObj)))
 			})
 		}
 		newRaw, err = json.Marshal(obj)
 		if err != nil {
-			return c.writer.UpdateStatus(ctx, c.key, func(d *kubeapplier.ReadDesire) {
-				d.SetDocumentID(c.key.Name)
-				d.Status.ObservedDesireUpdateTime = c.specUpdateTime
+			return c.updateStatus(ctx, func(d *kubeapplier.ReadDesire) {
 				conditions.SetSuccessful(&d.Status.Conditions, fmt.Errorf("marshal observed object: %w", err))
 			})
 		}
@@ -235,22 +232,27 @@ func (c *ReadDesireKubernetesController) SyncOnce(ctx context.Context) error {
 		existingRaw = desire.Status.KubeContent.Raw
 	}
 	if bytes.Equal(newRaw, existingRaw) {
-		return c.writer.UpdateStatus(ctx, c.key, func(d *kubeapplier.ReadDesire) {
-			d.SetDocumentID(c.key.Name)
-			d.Status.ObservedDesireUpdateTime = c.specUpdateTime
+		return c.updateStatus(ctx, func(d *kubeapplier.ReadDesire) {
 			conditions.SetSuccessful(&d.Status.Conditions, nil)
 		})
 	}
 
-	return c.writer.UpdateStatus(ctx, c.key, func(d *kubeapplier.ReadDesire) {
-		d.SetDocumentID(c.key.Name)
-		d.Status.ObservedDesireUpdateTime = c.specUpdateTime
+	return c.updateStatus(ctx, func(d *kubeapplier.ReadDesire) {
 		if newRaw == nil {
 			d.Status.KubeContent = nil
 		} else {
 			d.Status.KubeContent = &runtime.RawExtension{Raw: append([]byte(nil), newRaw...)}
 		}
 		conditions.SetSuccessful(&d.Status.Conditions, nil)
+	})
+}
+
+func (c *ReadDesireKubernetesController) updateStatus(ctx context.Context, mutate desirestatuswriter.MutateFunc[kubeapplier.ReadDesire]) error {
+	return c.writer.UpdateStatus(ctx, c.key, func(d *kubeapplier.ReadDesire) {
+		d.SetDocumentID(c.key.Name)
+		d.Spec = c.spec
+		d.Status.ObservedDesireUpdateTime = c.specUpdateTime
+		mutate(d)
 	})
 }
 
