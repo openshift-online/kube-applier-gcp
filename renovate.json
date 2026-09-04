@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "addLabels": ["ok-to-test"],
+  "addLabels": ["ok-to-test", "area/dependency"],
   "prConcurrentLimit": 10,
   "postUpdateOptions": [
     "gomodTidy",
