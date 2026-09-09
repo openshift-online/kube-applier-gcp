@@ -62,10 +62,14 @@ func TestEnqueueOrphanedStatuses(t *testing.T) {
 	cleaner := New[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]("test", specCRUD, statusCRUD, Config{})
 	var queued []string
 
-	if err := cleaner.enqueueOrphanedStatuses(ctx, func(d *kubeapplier.DeleteDesire) {
+	orphanCandidates, err := cleaner.enqueueOrphanedStatuses(ctx, func(d *kubeapplier.DeleteDesire) {
 		queued = append(queued, d.DocumentID)
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("enqueueOrphanedStatuses: %v", err)
+	}
+	if orphanCandidates != 1 {
+		t.Errorf("orphan candidates = %d, want 1", orphanCandidates)
 	}
 	if len(queued) != 1 || queued[0] != orphan.DocumentID {
 		t.Fatalf("queued %v, want [%s]", queued, orphan.DocumentID)

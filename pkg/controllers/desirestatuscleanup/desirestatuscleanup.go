@@ -67,6 +67,7 @@ func (c *Cleaner[T, PT]) DeleteStatus(ctx context.Context, documentID string) er
 	if err != nil {
 		return fmt.Errorf("delete orphaned status %s: %w", documentID, err)
 	}
+	klog.FromContext(ctx).Info("removed status for absent desire spec", "controller", c.name, "documentID", documentID)
 	return nil
 }
 
@@ -74,13 +75,14 @@ func (c *Cleaner[T, PT]) DeleteStatus(ctx context.Context, documentID string) er
 // Candidates are enqueued into the owning controller for an authoritative read
 // and serialized cleanup.
 func (c *Cleaner[T, PT]) RunStartupReconciliation(ctx context.Context, enqueue func(*T)) {
-	logger := klog.FromContext(ctx).WithName(c.name).WithName("StatusCleanup")
+	logger := klog.FromContext(ctx).WithName("StatusCleanup").WithValues("controller", c.name)
 	for {
-		if err := c.enqueueOrphanedStatuses(ctx, enqueue); err == nil {
+		orphanCandidates, err := c.enqueueOrphanedStatuses(ctx, enqueue)
+		if err == nil {
+			logger.Info("startup orphan reconciliation completed", "orphanCandidates", orphanCandidates)
 			return
-		} else {
-			logger.Error(err, "startup orphan reconciliation failed; retrying")
 		}
+		logger.Error(err, "startup orphan reconciliation failed; retrying")
 
 		select {
 		case <-ctx.Done():
@@ -90,25 +92,27 @@ func (c *Cleaner[T, PT]) RunStartupReconciliation(ctx context.Context, enqueue f
 	}
 }
 
-func (c *Cleaner[T, PT]) enqueueOrphanedStatuses(ctx context.Context, enqueue func(*T)) error {
+func (c *Cleaner[T, PT]) enqueueOrphanedStatuses(ctx context.Context, enqueue func(*T)) (int, error) {
 	specs, err := c.specReader.List(ctx)
 	if err != nil {
-		return fmt.Errorf("list desire specs: %w", err)
+		return 0, fmt.Errorf("list desire specs: %w", err)
 	}
 	statuses, err := c.statusCRUD.List(ctx)
 	if err != nil {
-		return fmt.Errorf("list desire statuses: %w", err)
+		return 0, fmt.Errorf("list desire statuses: %w", err)
 	}
 
 	specIDs := make(map[string]struct{}, len(specs))
 	for _, d := range specs {
 		specIDs[PT(d).GetDocumentID()] = struct{}{}
 	}
+	orphanCandidates := 0
 	for _, d := range statuses {
 		if _, exists := specIDs[PT(d).GetDocumentID()]; exists {
 			continue
 		}
 		enqueue(d)
+		orphanCandidates++
 	}
-	return nil
+	return orphanCandidates, nil
 }
