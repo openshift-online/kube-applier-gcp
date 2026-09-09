@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
@@ -157,8 +156,14 @@ func (c *ReadDesireKubernetesController) Run(ctx context.Context) {
 
 	c.queue.Add(c.key)
 
-	go wait.UntilWithContext(ctx, c.runWorker, time.Second)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		c.runWorker(ctx)
+	}()
 	<-ctx.Done()
+	c.queue.ShutDown()
+	<-workerDone
 }
 
 func (c *ReadDesireKubernetesController) runWorker(ctx context.Context) {
@@ -173,6 +178,10 @@ func (c *ReadDesireKubernetesController) processNext(ctx context.Context) bool {
 	}
 	defer c.queue.Done(key)
 	if err := c.SyncOnce(ctx); err != nil {
+		if ctx.Err() != nil {
+			c.queue.Forget(key)
+			return false
+		}
 		utilruntime.HandleErrorWithContext(ctx, err, "sync error; requeuing", "key", key)
 		c.queue.AddRateLimited(key)
 		return true
