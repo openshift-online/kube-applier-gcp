@@ -24,6 +24,7 @@ import (
 	"github.com/openshift-online/kube-applier-gcp/internal/database"
 	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
+	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuscleanup"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/read_desire_kubernetes"
@@ -66,6 +67,7 @@ type ReadDesireInformerManagingController struct {
 	specFetcher        *readDesireSpecFetcher
 	factory            PerInstanceFactory
 	writer             desirestatuswriter.StatusWriter[kubeapplier.ReadDesire, keys.ReadDesireKey]
+	cleaner            *desirestatuscleanup.Cleaner[kubeapplier.ReadDesire, *kubeapplier.ReadDesire]
 	queue              workqueue.TypedRateLimitingInterface[keys.ReadDesireKey]
 
 	cfg      Config
@@ -107,6 +109,9 @@ func NewReadDesireInformerManagingController(
 			statusFetcher,
 			&readDesireReplacer{crud: statusCRUD},
 			&readDesireCreator{crud: statusCRUD},
+		),
+		cleaner: desirestatuscleanup.New[kubeapplier.ReadDesire, *kubeapplier.ReadDesire](
+			"ReadDesireInformerManagingController", specReader, statusCRUD, desirestatuscleanup.Config{},
 		),
 		cfg:      cfg,
 		cooldown: cooldownChecker,
@@ -155,6 +160,7 @@ func (c *ReadDesireInformerManagingController) Run(ctx context.Context, threadin
 	for i := 0; i < threadiness; i++ {
 		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
+	go c.cleaner.RunStartupReconciliation(ctx, c.enqueue)
 	<-ctx.Done()
 }
 
@@ -233,7 +239,11 @@ func (c *ReadDesireInformerManagingController) processNext(ctx context.Context) 
 // is running with the desired TargetItem.
 func (c *ReadDesireInformerManagingController) SyncOnce(ctx context.Context, key keys.ReadDesireKey) error {
 	desire, err := c.specFetcher.Fetch(ctx, key)
-	if err != nil && !database.IsNotFoundError(err) {
+	if database.IsNotFoundError(err) {
+		c.stopByKey(key)
+		return c.cleaner.DeleteStatus(ctx, key.Name)
+	}
+	if err != nil {
 		return err
 	}
 	if desire == nil {

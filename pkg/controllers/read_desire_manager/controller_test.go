@@ -7,13 +7,16 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	clocktesting "k8s.io/utils/clock/testing"
 
 	"github.com/openshift-online/kube-applier-gcp/internal/controllerutils"
+	"github.com/openshift-online/kube-applier-gcp/internal/database"
 	"github.com/openshift-online/kube-applier-gcp/internal/database/listertesting"
 	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
+	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuscleanup"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
 )
@@ -139,6 +142,9 @@ func newTestController(
 		factory:     factory,
 		running:     map[keys.ReadDesireKey]*runningInstance{},
 		writer:      writer,
+		cleaner: desirestatuscleanup.New[kubeapplier.ReadDesire, *kubeapplier.ReadDesire](
+			"test", crud, crud, desirestatuscleanup.Config{},
+		),
 	}
 }
 
@@ -296,6 +302,13 @@ func TestManagerSyncOnce_StopsOnDelete(t *testing.T) {
 
 	factory := &recordingFakeFactory{}
 	c := newTestController(crud, factory, nil)
+	statusCRUD := listertesting.NewFakeCRUD[kubeapplier.ReadDesire, *kubeapplier.ReadDesire]()
+	if _, err := statusCRUD.Create(ctx, desire); err != nil {
+		t.Fatalf("create status: %v", err)
+	}
+	c.cleaner = desirestatuscleanup.New[kubeapplier.ReadDesire, *kubeapplier.ReadDesire](
+		"test", crud, statusCRUD, desirestatuscleanup.Config{},
+	)
 	key := testKey()
 
 	if err := c.SyncOnce(ctx, key); err != nil {
@@ -313,6 +326,9 @@ func TestManagerSyncOnce_StopsOnDelete(t *testing.T) {
 	<-factory.fakes[0].stopped
 	if c.Running(key) {
 		t.Errorf("manager.Running(%v) = true after delete; want false", key)
+	}
+	if _, err := statusCRUD.Get(ctx, desire.DocumentID); !database.IsNotFoundError(err) {
+		t.Fatalf("status should be deleted after watcher stops, got: %v", err)
 	}
 }
 
@@ -464,11 +480,27 @@ func TestHandleUpdate_UnchangedConsultsCooldown(t *testing.T) {
 	}
 }
 
-func TestHandleDelete_QueuesImmediately(t *testing.T) {
-	c := newCadenceController(t, Config{})
-	d := newReadDesire(t, configMapTarget("x"))
-	c.handleDelete(d)
-	if c.queue.Len() != 1 {
-		t.Errorf("expected 1 item, got %d", c.queue.Len())
+func TestHandleDelete_QueuesDirectAndTombstoneObjects(t *testing.T) {
+	tests := []struct {
+		name string
+		wrap func(*kubeapplier.ReadDesire) any
+	}{
+		{name: "direct", wrap: func(d *kubeapplier.ReadDesire) any { return d }},
+		{
+			name: "tombstone",
+			wrap: func(d *kubeapplier.ReadDesire) any {
+				return cache.DeletedFinalStateUnknown{Key: d.DocumentID, Obj: d}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCadenceController(t, Config{})
+			d := newReadDesire(t, configMapTarget("x"))
+			c.handleDelete(tt.wrap(d))
+			if c.queue.Len() != 1 {
+				t.Fatalf("expected 1 item, got %d", c.queue.Len())
+			}
+		})
 	}
 }
