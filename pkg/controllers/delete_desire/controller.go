@@ -41,14 +41,20 @@ import (
 // completed.
 const DefaultCooldownPeriod = 1 * time.Minute
 
+const defaultStartupReconciliationRetryPeriod = 5 * time.Second
+
 type Config struct {
-	CooldownPeriod time.Duration
-	Clock          utilsclock.PassiveClock
+	CooldownPeriod                   time.Duration
+	StartupReconciliationRetryPeriod time.Duration
+	Clock                            utilsclock.PassiveClock
 }
 
 func (c Config) withDefaults() Config {
 	if c.CooldownPeriod == 0 {
 		c.CooldownPeriod = DefaultCooldownPeriod
+	}
+	if c.StartupReconciliationRetryPeriod == 0 {
+		c.StartupReconciliationRetryPeriod = defaultStartupReconciliationRetryPeriod
 	}
 	if c.Clock == nil {
 		c.Clock = utilsclock.RealClock{}
@@ -62,6 +68,7 @@ type DeleteDesireController struct {
 	name                 string
 	deleteDesireInformer cache.SharedIndexInformer
 	specFetcher          *deleteDesireSpecFetcher
+	statusCRUD           database.ResourceCRUD[kubeapplier.DeleteDesire]
 	dyn                  dynamic.Interface
 	writer               desirestatuswriter.StatusWriter[kubeapplier.DeleteDesire, keys.DeleteDesireKey]
 	queue                workqueue.TypedRateLimitingInterface[keys.DeleteDesireKey]
@@ -88,6 +95,7 @@ func NewDeleteDesireController(
 		name:                 "DeleteDesireController",
 		deleteDesireInformer: deleteDesireInformer,
 		specFetcher:          specFetcher,
+		statusCRUD:           statusCRUD,
 		dyn:                  dyn,
 		writer: desirestatuswriter.New[kubeapplier.DeleteDesire, keys.DeleteDesireKey, *kubeapplier.DeleteDesire](
 			statusFetcher,
@@ -105,6 +113,7 @@ func NewDeleteDesireController(
 	if _, err := deleteDesireInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { c.handleAdd(obj) },
 		UpdateFunc: func(oldObj, newObj any) { c.handleUpdate(oldObj, newObj) },
+		DeleteFunc: func(obj any) { c.handleDelete(obj) },
 	}); err != nil {
 		return nil, fmt.Errorf("register informer handler: %w", err)
 	}
@@ -123,6 +132,7 @@ func (c *DeleteDesireController) Run(ctx context.Context, threadiness int) {
 	for i := 0; i < threadiness; i++ {
 		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
+	go c.runStartupReconciliation(ctx)
 	<-ctx.Done()
 }
 
@@ -153,6 +163,18 @@ func (c *DeleteDesireController) handleUpdate(oldObj, newObj any) {
 		return
 	}
 	c.queue.Add(key)
+}
+
+func (c *DeleteDesireController) handleDelete(obj any) {
+	switch obj := obj.(type) {
+	case *kubeapplier.DeleteDesire:
+		c.enqueue(obj)
+	case cache.DeletedFinalStateUnknown:
+		d, ok := obj.Obj.(*kubeapplier.DeleteDesire)
+		if ok {
+			c.enqueue(d)
+		}
+	}
 }
 
 func (c *DeleteDesireController) enqueue(d *kubeapplier.DeleteDesire) {
@@ -189,7 +211,7 @@ func (c *DeleteDesireController) processNext(ctx context.Context) bool {
 func (c *DeleteDesireController) SyncOnce(ctx context.Context, key keys.DeleteDesireKey) error {
 	desire, err := c.specFetcher.Fetch(ctx, key)
 	if database.IsNotFoundError(err) {
-		return nil
+		return c.deleteStatus(ctx, key.Name)
 	}
 	if err != nil {
 		return err
@@ -208,6 +230,57 @@ func (c *DeleteDesireController) SyncOnce(ctx context.Context, key keys.DeleteDe
 	})
 
 	return errors.Join(syncErr, statusErr)
+}
+
+func (c *DeleteDesireController) deleteStatus(ctx context.Context, documentID string) error {
+	err := c.statusCRUD.Delete(ctx, documentID)
+	if database.IsNotFoundError(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("delete orphaned status %s: %w", documentID, err)
+	}
+	return nil
+}
+
+func (c *DeleteDesireController) runStartupReconciliation(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+	for {
+		if err := c.enqueueOrphanedStatuses(ctx); err == nil {
+			return
+		} else {
+			logger.Error(err, "startup orphan reconciliation failed; retrying")
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(c.cfg.StartupReconciliationRetryPeriod):
+		}
+	}
+}
+
+func (c *DeleteDesireController) enqueueOrphanedStatuses(ctx context.Context) error {
+	specs, err := c.specFetcher.reader.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list delete desire specs: %w", err)
+	}
+	statuses, err := c.statusCRUD.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list delete desire statuses: %w", err)
+	}
+
+	specIDs := make(map[string]struct{}, len(specs))
+	for _, d := range specs {
+		specIDs[d.GetDocumentID()] = struct{}{}
+	}
+	for _, d := range statuses {
+		if _, exists := specIDs[d.GetDocumentID()]; exists {
+			continue
+		}
+		c.enqueue(d)
+	}
+	return nil
 }
 
 // evaluate runs the state machine for one DeleteDesire.

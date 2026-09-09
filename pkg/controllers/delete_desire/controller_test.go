@@ -3,11 +3,15 @@ package delete_desire
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/firestore"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -16,10 +20,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	clocktesting "k8s.io/utils/clock/testing"
 
 	"github.com/openshift-online/kube-applier-gcp/internal/controllerutils"
+	"github.com/openshift-online/kube-applier-gcp/internal/database"
 	"github.com/openshift-online/kube-applier-gcp/internal/database/listertesting"
 	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
@@ -296,12 +302,26 @@ func TestEvaluate_PreCheck_MissingFields(t *testing.T) {
 
 func TestSyncOnce_DesireNotFound(t *testing.T) {
 	ctx := context.Background()
-	crud := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
-	c := &DeleteDesireController{specFetcher: &deleteDesireSpecFetcher{reader: crud}}
+	specCRUD := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
+	statusCRUD := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
+	status := newDeleteDesire(t, "cm1", configMapTarget("cm1"))
+	if _, err := statusCRUD.Create(ctx, status); err != nil {
+		t.Fatalf("create status: %v", err)
+	}
+	c := &DeleteDesireController{
+		specFetcher: &deleteDesireSpecFetcher{reader: specCRUD},
+		statusCRUD:  statusCRUD,
+	}
 
 	key := keys.DeleteDesireKey{ClusterID: "c1", Name: "cluster1--cm1"}
 	if err := c.SyncOnce(ctx, key); err != nil {
 		t.Fatalf("SyncOnce should return nil for not-found, got: %v", err)
+	}
+	if _, err := statusCRUD.Get(ctx, key.Name); !database.IsNotFoundError(err) {
+		t.Fatalf("status should be deleted, got: %v", err)
+	}
+	if err := c.SyncOnce(ctx, key); err != nil {
+		t.Fatalf("repeated SyncOnce should be idempotent, got: %v", err)
 	}
 }
 
@@ -413,6 +433,138 @@ func TestHandleUpdate_UnchangedConsultsCooldown(t *testing.T) {
 	}
 }
 
+func TestHandleDelete_QueuesDirectAndTombstoneObjects(t *testing.T) {
+	tests := []struct {
+		name string
+		wrap func(*kubeapplier.DeleteDesire) any
+	}{
+		{
+			name: "direct",
+			wrap: func(d *kubeapplier.DeleteDesire) any { return d },
+		},
+		{
+			name: "tombstone",
+			wrap: func(d *kubeapplier.DeleteDesire) any {
+				return cache.DeletedFinalStateUnknown{Key: d.DocumentID, Obj: d}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCadenceController(t, Config{})
+			d := newDeleteDesire(t, "cm1", configMapTarget("cm1"))
+			c.handleDelete(tt.wrap(d))
+			if c.queue.Len() != 1 {
+				t.Fatalf("expected 1 item, got %d", c.queue.Len())
+			}
+		})
+	}
+}
+
+func TestEnqueueOrphanedStatuses(t *testing.T) {
+	ctx := context.Background()
+	specCRUD := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
+	statusCRUD := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
+
+	live := newDeleteDesire(t, "live", configMapTarget("live"))
+	orphan := newDeleteDesire(t, "orphan", configMapTarget("orphan"))
+	for _, seed := range []struct {
+		crud *listertesting.FakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]
+		obj  *kubeapplier.DeleteDesire
+	}{
+		{crud: specCRUD, obj: live},
+		{crud: statusCRUD, obj: live},
+		{crud: statusCRUD, obj: orphan},
+	} {
+		if _, err := seed.crud.Create(ctx, seed.obj); err != nil {
+			t.Fatalf("seed %s: %v", seed.obj.DocumentID, err)
+		}
+	}
+
+	c := newCadenceController(t, Config{})
+	c.specFetcher = &deleteDesireSpecFetcher{reader: specCRUD}
+	c.statusCRUD = statusCRUD
+	if err := c.enqueueOrphanedStatuses(ctx); err != nil {
+		t.Fatalf("enqueueOrphanedStatuses: %v", err)
+	}
+	if c.queue.Len() != 1 {
+		t.Fatalf("expected only orphan to be queued, got %d items", c.queue.Len())
+	}
+	key, _ := c.queue.Get()
+	c.queue.Done(key)
+	if key.Name != orphan.DocumentID {
+		t.Errorf("queued %q, want orphan %q", key.Name, orphan.DocumentID)
+	}
+}
+
+func TestStartupReconciliationRetriesListFailure(t *testing.T) {
+	ctx := context.Background()
+	specCRUD := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
+	statusCRUD := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
+	orphan := newDeleteDesire(t, "orphan", configMapTarget("orphan"))
+	if _, err := statusCRUD.Create(ctx, orphan); err != nil {
+		t.Fatalf("create status: %v", err)
+	}
+	flaky := &flakyListDeleteDesireCRUD{
+		ResourceCRUD: statusCRUD,
+		failures:     1,
+	}
+	c := newCadenceController(t, Config{StartupReconciliationRetryPeriod: time.Millisecond})
+	c.specFetcher = &deleteDesireSpecFetcher{reader: specCRUD}
+	c.statusCRUD = flaky
+
+	c.runStartupReconciliation(ctx)
+
+	if flaky.listCallCount() != 2 {
+		t.Errorf("List called %d times, want 2", flaky.listCallCount())
+	}
+	if c.queue.Len() != 1 {
+		t.Errorf("expected orphan to be queued after retry, got %d items", c.queue.Len())
+	}
+}
+
+func TestIntegration_SyncOnceDeletesOrphanedStatus(t *testing.T) {
+	if os.Getenv("FIRESTORE_EMULATOR_HOST") == "" {
+		t.Skip("FIRESTORE_EMULATOR_HOST not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	suffix := time.Now().UnixNano()
+	specsClient, err := firestore.NewClientWithDatabase(ctx, "test-project", fmt.Sprintf("specs-%d", suffix))
+	if err != nil {
+		t.Fatalf("create specs client: %v", err)
+	}
+	defer specsClient.Close()
+	statusClient, err := firestore.NewClientWithDatabase(ctx, "test-project", fmt.Sprintf("status-%d", suffix))
+	if err != nil {
+		t.Fatalf("create status client: %v", err)
+	}
+	defer statusClient.Close()
+
+	dbClient := database.NewFirestoreKubeApplierDBClient(specsClient, statusClient)
+	statusCRUD := dbClient.DeleteDesireStatus()
+	orphan := newDeleteDesire(t, "orphan", configMapTarget("orphan"))
+	if _, err := statusCRUD.Create(ctx, orphan); err != nil {
+		t.Fatalf("create orphaned status: %v", err)
+	}
+	c := &DeleteDesireController{
+		specFetcher: &deleteDesireSpecFetcher{reader: dbClient.DeleteDesireSpecs()},
+		statusCRUD:  statusCRUD,
+	}
+	key := mustKey(t, orphan)
+
+	if err := c.SyncOnce(ctx, key); err != nil {
+		t.Fatalf("SyncOnce: %v", err)
+	}
+	if _, err := statusCRUD.Get(ctx, orphan.DocumentID); !database.IsNotFoundError(err) {
+		t.Fatalf("status should be deleted, got: %v", err)
+	}
+	if err := c.SyncOnce(ctx, key); err != nil {
+		t.Fatalf("repeated SyncOnce should be idempotent, got: %v", err)
+	}
+}
+
 func TestDefaultCooldownPeriod_IsOneMinute(t *testing.T) {
 	if DefaultCooldownPeriod != 1*time.Minute {
 		t.Errorf("expected 1m, got %v", DefaultCooldownPeriod)
@@ -448,6 +600,32 @@ func assertConditionMessage(t *testing.T, conds []metav1.Condition, condType str
 		}
 	}
 	t.Errorf("condition %s not found", condType)
+}
+
+type flakyListDeleteDesireCRUD struct {
+	database.ResourceCRUD[kubeapplier.DeleteDesire]
+
+	mu        sync.Mutex
+	failures  int
+	listCalls int
+}
+
+func (f *flakyListDeleteDesireCRUD) List(ctx context.Context) ([]*kubeapplier.DeleteDesire, error) {
+	f.mu.Lock()
+	f.listCalls++
+	if f.failures > 0 {
+		f.failures--
+		f.mu.Unlock()
+		return nil, errors.New("transient list failure")
+	}
+	f.mu.Unlock()
+	return f.ResourceCRUD.List(ctx)
+}
+
+func (f *flakyListDeleteDesireCRUD) listCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listCalls
 }
 
 // suppress unused import warnings
