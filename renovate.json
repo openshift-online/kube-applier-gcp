@@ -5,5 +5,14 @@
   "postUpdateOptions": [
     "gomodTidy",
     "gomodUpdateImportPaths"
-  ]
+  ],
+  "gomod": {
+    "packageRules": [
+      {
+        "matchPackageNames": ["golang.org/x/**"],
+        "groupName": "golang.org/x packages",
+        "groupSlug": "golang-org-x"
+      }
+    ]
+  }
 }
