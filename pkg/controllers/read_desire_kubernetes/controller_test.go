@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	"github.com/openshift-online/kube-applier-gcp/internal/database/listertesting"
 	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
@@ -50,6 +51,23 @@ type recordingWriter struct {
 	desire  *kubeapplier.ReadDesire
 }
 
+type errorWriter struct{ err error }
+
+func (w errorWriter) UpdateStatus(context.Context, keys.ReadDesireKey, desirestatuswriter.MutateFunc[kubeapplier.ReadDesire]) error {
+	return w.err
+}
+
+type blockingWriter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w blockingWriter) UpdateStatus(context.Context, keys.ReadDesireKey, desirestatuswriter.MutateFunc[kubeapplier.ReadDesire]) error {
+	close(w.started)
+	<-w.release
+	return context.Canceled
+}
+
 func (w *recordingWriter) UpdateStatus(_ context.Context, _ keys.ReadDesireKey, mutate desirestatuswriter.MutateFunc[kubeapplier.ReadDesire]) error {
 	if w.desire == nil {
 		return nil
@@ -86,6 +104,9 @@ type fakeInformer struct {
 
 func (f *fakeInformer) GetStore() cache.Store { return f.indexer }
 func (f *fakeInformer) HasSynced() bool       { return f.synced }
+func (f *fakeInformer) RunWithContext(ctx context.Context) {
+	<-ctx.Done()
+}
 
 func testConfigMap(name string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
@@ -273,6 +294,91 @@ func TestSyncOnce_DesireNotFound(t *testing.T) {
 	}
 	if len(writer.updates) != 0 {
 		t.Errorf("expected 0 updates for not-found desire, got %d", len(writer.updates))
+	}
+}
+
+func TestProcessNext_DoesNotRequeueCancellationDuringShutdown(t *testing.T) {
+	desire := newReadDesire(t, configMapTarget("cm1"))
+	key := testKey()
+	c := &ReadDesireKubernetesController{
+		key:            key,
+		spec:           desire.Spec,
+		target:         desire.Spec.TargetItem,
+		specUpdateTime: desire.GetUpdateTime(),
+		namespaced:     true,
+		informer:       syncedInformer(),
+		fetcher:        &readDesireStatusFetcher{crud: crudWithDesire(t, desire)},
+		writer:         errorWriter{err: context.Canceled},
+		queue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[keys.ReadDesireKey](),
+		),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.queue.Add(key)
+
+	if c.processNext(ctx) {
+		t.Fatal("processNext should stop during shutdown")
+	}
+	if got := c.queue.NumRequeues(key); got != 0 {
+		t.Errorf("requeues = %d, want 0", got)
+	}
+}
+
+func TestRunWaitsForInFlightWorkerDuringShutdown(t *testing.T) {
+	desire := newReadDesire(t, configMapTarget("cm1"))
+	key := testKey()
+	writer := blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+	c := &ReadDesireKubernetesController{
+		key:            key,
+		spec:           desire.Spec,
+		target:         desire.Spec.TargetItem,
+		specUpdateTime: desire.GetUpdateTime(),
+		namespaced:     true,
+		informer:       syncedInformer(),
+		fetcher:        &readDesireStatusFetcher{crud: crudWithDesire(t, desire)},
+		writer:         writer,
+		queue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[keys.ReadDesireKey](),
+		),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		c.Run(ctx)
+	}()
+
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		close(writer.release)
+		cancel()
+		t.Fatal("worker did not start")
+	}
+	cancel()
+
+	deadline := time.After(time.Second)
+	for !c.queue.ShuttingDown() {
+		select {
+		case <-deadline:
+			close(writer.release)
+			t.Fatal("queue did not begin shutdown")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case <-runDone:
+		close(writer.release)
+		t.Fatal("Run returned while its worker was still active")
+	default:
+	}
+
+	close(writer.release)
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after its worker exited")
 	}
 }
 

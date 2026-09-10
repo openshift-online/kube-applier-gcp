@@ -154,6 +154,10 @@ and a `ResourceCRUD` for writing status to status-db. The `desirestatuswriter`
 package uses a create-or-replace pattern: on first reconcile the status document
 does not exist yet (since it lives in a separate database from the spec), so the
 writer creates it; on subsequent reconciles it replaces the existing document.
+When a spec document is removed, the owning controller confirms that it is
+absent from the specs database and removes the matching status document. Each
+controller also performs a background startup reconciliation to remove status
+documents whose specs were deleted while the agent was unavailable.
 
 Informers and listers are constructed separately at app wiring time via
 `informers.NewKubeApplierInformers(specsClient)`. They watch the **specs database
@@ -202,7 +206,8 @@ working. A separate "watch was last (re)launched at" timestamp turned out
 to be uninterpretable — consumers cannot distinguish a target-driven
 relaunch from a process restart — so it is not surfaced.
 
-When a `ReadDesire` is deleted, the `ReadDesireKubernetesController` instance is stopped and discarded.
+When a `ReadDesire` is deleted, the `ReadDesireKubernetesController` instance is
+stopped and discarded before its status document is removed.
 
 ### DeleteDesireController
 This controller uses the `DeleteDesire` informer to feed a sync function for `DeleteDesire` instances.
@@ -221,13 +226,18 @@ When the sync loop runs, it will:
             success; otherwise report `WaitingForDeletion` with its deletion
             timestamp and UID.
 
-This controller resyncs every 60 seconds.
+This controller resyncs every 60 seconds. When a `DeleteDesire` spec is removed,
+the controller removes its status document.
 
 ### ApplyDesireController
 This controller uses the `ApplyDesire` informer to feed a sync function for `ApplyDesire` instances.
 When the sync loop runs, it will:
 1. Issue a server-side apply with force the `.spec.kubeContent`
 2. Use the standard rules for `.status.conditions["Successful"]`
+
+When an `ApplyDesire` spec is removed, the controller removes its status
+document. Removing the spec does not delete the Kubernetes resource; resource
+deletion is represented separately by a `DeleteDesire`.
 
 #### Adopting existing resources
 SSA's `force=true` claims field ownership over fields the kube-applier writes

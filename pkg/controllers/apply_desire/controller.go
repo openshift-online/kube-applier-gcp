@@ -30,6 +30,7 @@ import (
 	"github.com/openshift-online/kube-applier-gcp/internal/database"
 	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
+	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuscleanup"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
 )
@@ -75,6 +76,7 @@ type ApplyDesireController struct {
 	specFetcher         desirestatuswriter.Fetcher[kubeapplier.ApplyDesire, keys.ApplyDesireKey]
 	dyn                 dynamic.Interface
 	writer              desirestatuswriter.StatusWriter[kubeapplier.ApplyDesire, keys.ApplyDesireKey]
+	cleaner             *desirestatuscleanup.Cleaner[kubeapplier.ApplyDesire, *kubeapplier.ApplyDesire]
 	queue               workqueue.TypedRateLimitingInterface[keys.ApplyDesireKey]
 
 	cfg      Config
@@ -105,6 +107,9 @@ func NewApplyDesireController(
 			&applyDesireReplacer{crud: statusCRUD},
 			&applyDesireCreator{crud: statusCRUD},
 		),
+		cleaner: desirestatuscleanup.New[kubeapplier.ApplyDesire, *kubeapplier.ApplyDesire](
+			"ApplyDesireController", specReader, statusCRUD, desirestatuscleanup.Config{},
+		),
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[keys.ApplyDesireKey](),
 			workqueue.TypedRateLimitingQueueConfig[keys.ApplyDesireKey]{Name: "ApplyDesireController"},
@@ -116,6 +121,7 @@ func NewApplyDesireController(
 	if _, err := applyDesireInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { c.handleAdd(obj) },
 		UpdateFunc: func(oldObj, newObj any) { c.handleUpdate(oldObj, newObj) },
+		DeleteFunc: func(obj any) { c.handleDelete(obj) },
 	}); err != nil {
 		return nil, fmt.Errorf("register informer handler: %w", err)
 	}
@@ -135,6 +141,7 @@ func (c *ApplyDesireController) Run(ctx context.Context, threadiness int) {
 	for i := 0; i < threadiness; i++ {
 		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
+	go c.cleaner.RunStartupReconciliation(ctx, c.enqueue)
 	<-ctx.Done()
 }
 
@@ -154,6 +161,18 @@ func (c *ApplyDesireController) handleUpdate(oldObj, newObj any) {
 	}
 	changed := !oldD.UpdateTime.Equal(newD.UpdateTime)
 	c.enqueueWithCooldown(newD, changed)
+}
+
+func (c *ApplyDesireController) handleDelete(obj any) {
+	switch obj := obj.(type) {
+	case *kubeapplier.ApplyDesire:
+		c.enqueue(obj)
+	case cache.DeletedFinalStateUnknown:
+		d, ok := obj.Obj.(*kubeapplier.ApplyDesire)
+		if ok {
+			c.enqueue(d)
+		}
+	}
 }
 
 func (c *ApplyDesireController) enqueue(d *kubeapplier.ApplyDesire) {
@@ -206,7 +225,7 @@ func (c *ApplyDesireController) processNext(ctx context.Context) bool {
 func (c *ApplyDesireController) SyncOnce(ctx context.Context, key keys.ApplyDesireKey) error {
 	desire, err := c.specFetcher.Fetch(ctx, key)
 	if database.IsNotFoundError(err) {
-		return nil
+		return c.cleaner.DeleteStatus(ctx, key.Name)
 	}
 	if err != nil {
 		return err

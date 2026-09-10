@@ -16,13 +16,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	clocktesting "k8s.io/utils/clock/testing"
 
 	"github.com/openshift-online/kube-applier-gcp/internal/controllerutils"
+	"github.com/openshift-online/kube-applier-gcp/internal/database"
 	"github.com/openshift-online/kube-applier-gcp/internal/database/listertesting"
 	"github.com/openshift-online/kube-applier-gcp/pkg/api/kubeapplier"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/conditions"
+	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuscleanup"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/desirestatuswriter"
 	"github.com/openshift-online/kube-applier-gcp/pkg/controllers/keys"
 )
@@ -296,12 +299,28 @@ func TestEvaluate_PreCheck_MissingFields(t *testing.T) {
 
 func TestSyncOnce_DesireNotFound(t *testing.T) {
 	ctx := context.Background()
-	crud := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
-	c := &DeleteDesireController{specFetcher: &deleteDesireSpecFetcher{reader: crud}}
+	specCRUD := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
+	statusCRUD := listertesting.NewFakeCRUD[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire]()
+	status := newDeleteDesire(t, "cm1", configMapTarget("cm1"))
+	if _, err := statusCRUD.Create(ctx, status); err != nil {
+		t.Fatalf("create status: %v", err)
+	}
+	c := &DeleteDesireController{
+		specFetcher: &deleteDesireSpecFetcher{reader: specCRUD},
+		cleaner: desirestatuscleanup.New[kubeapplier.DeleteDesire, *kubeapplier.DeleteDesire](
+			"test", specCRUD, statusCRUD, desirestatuscleanup.Config{},
+		),
+	}
 
 	key := keys.DeleteDesireKey{ClusterID: "c1", Name: "cluster1--cm1"}
 	if err := c.SyncOnce(ctx, key); err != nil {
 		t.Fatalf("SyncOnce should return nil for not-found, got: %v", err)
+	}
+	if _, err := statusCRUD.Get(ctx, key.Name); !database.IsNotFoundError(err) {
+		t.Fatalf("status should be deleted, got: %v", err)
+	}
+	if err := c.SyncOnce(ctx, key); err != nil {
+		t.Fatalf("repeated SyncOnce should be idempotent, got: %v", err)
 	}
 }
 
@@ -410,6 +429,34 @@ func TestHandleUpdate_UnchangedConsultsCooldown(t *testing.T) {
 	c.handleUpdate(d, d)
 	if c.queue.Len() != 1 {
 		t.Errorf("expected 1 item after cooldown, got %d", c.queue.Len())
+	}
+}
+
+func TestHandleDelete_QueuesDirectAndTombstoneObjects(t *testing.T) {
+	tests := []struct {
+		name string
+		wrap func(*kubeapplier.DeleteDesire) any
+	}{
+		{
+			name: "direct",
+			wrap: func(d *kubeapplier.DeleteDesire) any { return d },
+		},
+		{
+			name: "tombstone",
+			wrap: func(d *kubeapplier.DeleteDesire) any {
+				return cache.DeletedFinalStateUnknown{Key: d.DocumentID, Obj: d}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCadenceController(t, Config{})
+			d := newDeleteDesire(t, "cm1", configMapTarget("cm1"))
+			c.handleDelete(tt.wrap(d))
+			if c.queue.Len() != 1 {
+				t.Fatalf("expected 1 item, got %d", c.queue.Len())
+			}
+		})
 	}
 }
 
