@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
@@ -159,7 +160,7 @@ func (c *ReadDesireKubernetesController) Run(ctx context.Context) {
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
-		c.runWorker(ctx)
+		wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}()
 	<-ctx.Done()
 	c.queue.ShutDown()
