@@ -256,3 +256,12 @@ database clients with `UpdateTime`-based optimistic concurrency tracking.
 Database integration tests use the Firestore emulator configured through
 `FIRESTORE_EMULATOR_HOST`. Controller tests use client-go fake Kubernetes clients;
 this repository does not currently run a real kube-apiserver in its test suite.
+
+### End-to-end platform testing
+
+Commenting `/test e2e-platform` on a pull request deploys this repository's
+build on the management cluster, on top of the latest promoted
+`gcp-hcp-infra` `main`, and runs the full GCP HCP platform e2e suite against
+it. The job is manual-only (it does not run automatically or block merge),
+and is defined in `openshift/release` alongside the same `gcp-hcp-e2e`
+workflow Gecko uses for its own pull requests.
