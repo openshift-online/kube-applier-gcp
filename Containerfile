@@ -5,7 +5,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /opt/app-root/src/kube-applier-gcp .
 
-FROM registry.access.redhat.com/ubi9/ubi-micro:9.8-1794184668
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.9-1793867126
 
 LABEL name="kube-applier-gcp" \
       com.redhat.component="kube-applier-gcp" \
