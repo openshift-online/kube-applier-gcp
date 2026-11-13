@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9/go-toolset:1.26.10-1794208260 AS builder
+FROM registry.access.redhat.com/ubi9/go-toolset:1.27.3-1794518352 AS builder
 WORKDIR /opt/app-root/src
 COPY go.mod go.sum ./
 RUN go mod download
