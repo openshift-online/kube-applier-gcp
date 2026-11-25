@@ -14,7 +14,7 @@ vet:
 	go vet ./...
 
 image:
-	docker build -f Containerfile -t $(IMAGE):$(TAG) .
+	docker build -t $(IMAGE):$(TAG) .
 
 kind-setup:
 	./hack/setup-kind.sh
